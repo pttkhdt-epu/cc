@@ -337,10 +337,616 @@ img19
 
 ## 3.1 Mã trình chức năng **Đăng nhập**
 
-...
+### 3.1.1 Entity **USER**
+
+```js
+const bcrypt = require('bcrypt');
+const mysql = require('mysql2/promise');
+require('dotenv').config();
+
+class User {
+  constructor({ id, username, passwordHash, role = 'NV', status = 'ACTIVE' }) {
+    this.id = id;
+    this.username = username;
+    this.passwordHash = passwordHash;
+    this.role = role;        // 'QTV' | 'CCH' | 'NV'
+    this.status = status;    // 'ACTIVE' | 'LOCKED'
+  }
+
+  isActive() {
+    return this.status === 'ACTIVE';
+  }
+
+  checkRole(requiredRole) {
+    return this.role === requiredRole;
+  }
+
+  async checkPassword(plain) {
+    return bcrypt.compare(plain, this.passwordHash);
+  }
+}
+
+// Kết nối MySQL
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+// Repository
+const userRepo = {
+  async findByUsername(username) {
+    const [rows] = await pool.query('SELECT * FROM users WHERE username = ?', [username]);
+    if (!rows.length) return null;
+    const userData = rows[0];
+    return new User({
+      id: userData.id,
+      username: userData.username,
+      passwordHash: userData.password_hash, // cột trong DB
+      role: userData.role,
+      status: userData.status
+    });
+  }
+};
+
+module.exports = { User, userRepo };
+
+```
+
+### 3.1.2 AuthenticationController (Control):
+
+```js
+const jwt = require('jsonwebtoken');
+const { userRepo } = require('../models/user');
+require('dotenv').config(); // đọc biến môi trường
+
+const JWT_SECRET = process.env.JWT_SECRET;
+
+async function login(req, res) {
+  const { username, password } = req.body;
+
+  try {
+    const user = await userRepo.findByUsername(username);
+    if (!user) {
+      return res.status(401).json({ message: 'Sai tài khoản hoặc mật khẩu' });
+    }
+
+    if (!user.isActive()) {
+      return res.status(403).json({ message: 'Tài khoản đã ngưng hoạt động' });
+    }
+
+    const ok = await user.checkPassword(password);
+    if (!ok) {
+      return res.status(401).json({ message: 'Sai tài khoản hoặc mật khẩu' });
+    }
+
+    // Tạo token phiên
+    const token = jwt.sign(
+      { userId: user.id, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '8h' }
+    );
+
+    res.json({ token, role: user.role });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ message: 'Lỗi server' });
+  }
+}
+
+function authorize(requiredRole) {
+  // middleware kiểm tra token + quyền
+  return (req, res, next) => {
+    const auth = req.headers.authorization || '';
+    const token = auth.replace('Bearer ', '');
+    if (!token) return res.status(401).json({ message: 'Chưa đăng nhập' });
+
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      req.user = payload;
+
+      if (requiredRole && payload.role !== requiredRole) {
+        return res.status(403).json({ message: 'Không đủ quyền' });
+      }
+
+      next();
+    } catch (err) {
+      return res.status(401).json({ message: 'Phiên không hợp lệ' });
+    }
+  };
+}
+
+module.exports = { login, authorize };
+
+```
+
+### 3.1.3 Login form:
+
+```js
+<!-- login-->
+<form id="login-form">
+  <input name="username" placeholder="Tên đăng nhập">
+  <input name="password" type="password" placeholder="Mật khẩu">
+  <button type="submit">Đăng nhập</button>
+</form>
+
+<script>
+document.getElementById('login-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const form = e.target;
+
+  const body = {
+    username: form.username.value,
+    password: form.password.value
+  };
+
+  const res = await fetch('/api/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body)
+  });
+
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data.message || 'Đăng nhập thất bại');
+    return;
+  }
+
+  // Lưu token vào localStorage để các API khác dùng
+  localStorage.setItem('token', data.token);
+  alert('Đăng nhập thành công, vai trò: ' + data.role);
+  // chuyển hướng tùy role (QTV/CCH/NV)
+});
+</script>
+
+```
+
 
 ## 3.2 Mã trình chức năng **Tạo hóa đơn**
 
-...
+### 3.2.1 Entity Invoice & Payment:
 
+```js
+const mysql = require('mysql2/promise');
+require('dotenv').config();
+
+// Kết nối MySQL
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+// ===== Invoice =====
+class Invoice {
+  constructor({ id, amount, currency = 'VND', note, status = 'PENDING', method = null }) {
+    this.id = id;
+    this.amount = amount;
+    this.currency = currency;
+    this.note = note;
+    this.status = status;
+    this.method = method;
+  }
+
+  markPending() { this.status = 'PENDING'; }
+  markPaid()    { this.status = 'PAID'; }
+  markFailed()  { this.status = 'FAILED'; }
+  cancel()      { this.status = 'CANCELED'; }
+}
+
+const invoiceRepo = {
+  async create(data) {
+    const [result] = await pool.query(
+      `INSERT INTO invoices (amount, currency, note, status, method)
+       VALUES (?, ?, ?, ?, ?)`,
+      [data.amount, data.currency || 'VND', data.note, data.status || 'PENDING', data.method || null]
+    );
+    return new Invoice({ id: result.insertId, ...data });
+  },
+
+  async findById(id) {
+    const [rows] = await pool.query('SELECT * FROM invoices WHERE id = ?', [id]);
+    if (!rows.length) return null;
+    return new Invoice(rows[0]);
+  }
+};
+
+// ===== Payment =====
+class Payment {
+  constructor({ id, invoiceId, method, amount, providerRef = null, status = 'PENDING' }) {
+    this.id = id;
+    this.invoiceId = invoiceId;
+    this.method = method;
+    this.amount = amount;
+    this.providerRef = providerRef;
+    this.status = status;
+  }
+
+  approve() { this.status = 'SUCCESS'; }
+  decline() { this.status = 'FAILED'; }
+}
+
+const paymentRepo = {
+  async create(data) {
+    const [result] = await pool.query(
+      `INSERT INTO payments (invoice_id, method, amount, provider_ref, status)
+       VALUES (?, ?, ?, ?, ?)`,
+      [data.invoiceId, data.method, data.amount, data.providerRef || null, data.status || 'PENDING']
+    );
+    return new Payment({ id: result.insertId, ...data });
+  },
+
+  async findByProviderRef(ref) {
+    const [rows] = await pool.query('SELECT * FROM payments WHERE provider_ref = ?', [ref]);
+    if (!rows.length) return null;
+    return new Payment(rows[0]);
+  }
+};
+
+module.exports = { Invoice, Payment, invoiceRepo, paymentRepo };
+
+```
+
+### 3.2.2 InvoiceController – tạo hóa đơn & thanh toán:
+
+```js
+const { invoiceRepo, paymentRepo } = require('../models/invoice');
+
+// Giả lập cổng thanh toán
+const gatewayAdapter = {
+  async createPaymentRequest(invoice) {
+    // Trả về URL cổng thanh toán
+    const fakeProviderRef = 'GW-' + invoice.id + '-' + Date.now();
+    const paymentUrl = `https://gateway-demo/pay?ref=${fakeProviderRef}`;
+    return { providerRef: fakeProviderRef, paymentUrl };
+  }
+};
+
+// Tạo hóa đơn
+async function createInvoice(req, res) {
+  const { amount, note, method } = req.body; // method: 'CASH' hoặc 'ONLINE'
+
+  if (!amount || !method) {
+    return res.status(400).json({ message: 'Thiếu số tiền hoặc phương thức' });
+  }
+
+  try {
+    // 1️⃣ Tạo invoice trong DB
+    const invoice = await invoiceRepo.create({
+      amount,
+      note,
+      method,
+      status: 'PENDING'
+    });
+
+    // 2️⃣ Nếu là tiền mặt: đánh dấu đã thanh toán luôn
+    if (method === 'CASH') {
+      invoice.markPaid();
+      await paymentRepo.create({
+        invoiceId: invoice.id,
+        method: 'CASH',
+        amount,
+        providerRef: null,
+        status: 'SUCCESS'
+      });
+
+      // Có thể update status hóa đơn trong DB nếu muốn
+      await invoiceRepo.updateStatus(invoice.id, invoice.status);
+
+      return res.json({ invoice, message: 'Đã ghi nhận thanh toán tiền mặt' });
+    }
+
+    // 3️⃣ Nếu ONLINE: tạo yêu cầu cổng thanh toán
+    if (method === 'ONLINE') {
+      const { providerRef, paymentUrl } = await gatewayAdapter.createPaymentRequest(invoice);
+      await paymentRepo.create({
+        invoiceId: invoice.id,
+        method: 'ONLINE',
+        amount,
+        providerRef,
+        status: 'PENDING'
+      });
+
+      return res.json({
+        invoice,
+        paymentUrl,
+        message: 'Hóa đơn tạo thành công, chuyển khách đến URL thanh toán'
+      });
+    }
+
+    return res.status(400).json({ message: 'Phương thức không hỗ trợ' });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ message: 'Lỗi server' });
+  }
+}
+
+module.exports = { createInvoice };
+
+```
+
+### 3.2.3 Webhook nhận kết quả thanh toán (UC03):
+
+```js
+const { invoiceRepo, paymentRepo } = require('../models/invoice');
+
+// status: 'SUCCESS' | 'FAILED'
+async function handleGatewayWebhook(req, res) {
+  const { providerRef, status } = req.body;
+
+  try {
+    // Tìm payment theo providerRef
+    const payment = await paymentRepo.findByProviderRef(providerRef);
+    if (!payment) {
+      return res.json({ ok: true });
+    }
+
+    // Nếu đã xử lý rồi, bỏ qua
+    if (payment.status === 'SUCCESS' || payment.status === 'FAILED') {
+      return res.json({ ok: true, message: 'Đã xử lý trước đó' });
+    }
+
+    // Tìm invoice liên quan
+    const invoice = await invoiceRepo.findById(payment.invoiceId);
+    if (!invoice) {
+      return res.json({ ok: true, message: 'Không tìm thấy hóa đơn' });
+    }
+
+    // Cập nhật trạng thái payment + invoice
+    if (status === 'SUCCESS') {
+      payment.approve();
+      invoice.markPaid();
+    } else {
+      payment.decline();
+      invoice.markFailed();
+    }
+
+    // Lưu vào DB
+    await paymentRepo.updateStatus(payment.id, payment.status);
+    await invoiceRepo.updateStatus(invoice.id, invoice.status);
+
+    return res.json({ ok: true });
+  } catch (err) {
+    console.error(err);
+    return res.status(500).json({ ok: false, message: 'Lỗi server' });
+  }
+}
+
+module.exports = { handleGatewayWebhook };
+
+```
+
+### 3.2.4 Form tạo hóa đơn
+
+```js
+<form id="invoice-form">
+  <input name="amount" type="number" placeholder="Số tiền">
+  <textarea name="note" placeholder="Ghi chú"></textarea>
+  <select name="method">
+    <option value="CASH">Thanh toán tiền mặt</option>
+    <option value="ONLINE">Thanh toán online</option>
+  </select>
+  <button type="submit">Tạo hóa đơn</button>
+</form>
+
+<script>
+const token = localStorage.getItem('token');
+
+document.getElementById('invoice-form').addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const f = e.target;
+  const body = {
+    amount: Number(f.amount.value),
+    note: f.note.value,
+    method: f.method.value
+  };
+
+  const res = await fetch('/api/invoices', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token
+    },
+    body: JSON.stringify(body)
+  });
+
+  const data = await res.json();
+  if (!res.ok) return alert(data.message || 'Lỗi tạo hóa đơn');
+
+  if (data.paymentUrl) {
+    // hóa đơn online => mở URL thanh toán
+    window.open(data.paymentUrl, '_blank');
+  } else {
+    alert('Đã ghi nhận thanh toán tiền mặt');
+  }
+});
+</script>
+
+```
 ## 3.3 Mã trình chức năng **Đối soát, sao kê**
+
+### 3.3.1 Entity Report & ReportLine
+
+```js
+const mysql = require('mysql2/promise');
+require('dotenv').config();
+
+// Kết nối MySQL
+const pool = mysql.createPool({
+  host: process.env.DB_HOST,
+  user: process.env.DB_USER,
+  password: process.env.DB_PASSWORD,
+  database: process.env.DB_NAME,
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0
+});
+
+// ===== Report =====
+class Report {
+  constructor({ id, period, channel, totals, createdAt }) {
+    this.id = id;
+    this.period = period;   // vd: '2024-10-01..2024-10-31'
+    this.channel = channel; // 'ONLINE' | 'CASH' | 'ALL'
+    this.totals = totals;   // { totalAmount, matchedAmount, unmatchedAmount }
+    this.createdAt = createdAt || new Date();
+  }
+}
+
+// ===== ReportLine =====
+class ReportLine {
+  constructor({ id, reportId, invoiceId, paymentId, bankRef, status, note }) {
+    this.id = id;
+    this.reportId = reportId;
+    this.invoiceId = invoiceId || null;
+    this.paymentId = paymentId || null;
+    this.bankRef = bankRef || null;
+    this.status = status;   // 'MATCH' | 'UNMATCH' | 'DUPLICATE'
+    this.note = note || '';
+  }
+}
+
+// ===== Repository =====
+const reportRepo = {
+  // Lưu report + lines vào DB
+  async save(report, lines) {
+    // 1️⃣ Lưu report
+    const [result] = await pool.query(
+      `INSERT INTO reports (period, channel, total_amount, matched_amount, unmatched_amount, created_at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      [
+        report.period,
+        report.channel,
+        report.totals.totalAmount || 0,
+        report.totals.matchedAmount || 0,
+        report.totals.unmatchedAmount || 0,
+        report.createdAt
+      ]
+    );
+
+    report.id = result.insertId;
+
+    // 2️⃣ Lưu từng line
+    for (let i = 0; i < lines.length; i++) {
+      const l = lines[i];
+      const [lineResult] = await pool.query(
+        `INSERT INTO report_lines (report_id, invoice_id, payment_id, bank_ref, status, note)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        [
+          report.id,
+          l.invoiceId,
+          l.paymentId,
+          l.bankRef,
+          l.status,
+          l.note
+        ]
+      );
+      l.id = lineResult.insertId;
+      l.reportId = report.id;
+    }
+
+    return { report, lines };
+  }
+};
+
+module.exports = { Report, ReportLine, reportRepo };
+
+```
+
+### 3.3.2 Hàm parse sao kê
+
+```js
+// services/statementParser.js
+function parseCsvStatement(csvText) {
+  // Giả sử format: date,amount,providerRef,description
+  const lines = csvText.trim().split('\n');
+  const header = lines.shift();
+
+  return lines.map(line => {
+    const [dateStr, amountStr, providerRef, description] = line.split(',');
+    return {
+      date: new Date(dateStr),
+      amount: Number(amountStr),
+      providerRef: providerRef || null,
+      description: description || ''
+    };
+  });
+}
+
+module.exports = { parseCsvStatement };
+
+```
+
+### 3.3.3 ReconcileService – logic đối soát cốt lõi
+
+```js
+// services/reconcileService.js
+const { payments } = require('../models/invoice');
+const { Report, ReportLine, reportRepo } = require('../models/report');
+
+async function reconcile(bankTxns, { period, channel = 'ONLINE' }) {
+  const lines = [];
+
+  // Lọc payment nội bộ theo channel (vd lọc theo: ONLINE)
+  const internalPayments = payments.filter(p => {
+    if (channel === 'ALL') return true;
+    return p.method === channel;
+  });
+
+  let totalAmount = 0;
+  let matchedAmount = 0;
+
+  for (const tx of bankTxns) {
+    totalAmount += tx.amount;
+
+    // ưu tiên match theo providerRef
+    let matches = internalPayments.filter(p => p.providerRef === tx.providerRef);
+
+    // fallback: match theo số tiền
+    if (matches.length === 0) {
+      matches = internalPayments.filter(p => p.amount === tx.amount);
+    }
+
+    if (matches.length === 1) {
+      const p = matches[0];
+      matchedAmount += tx.amount;
+      lines.push(new ReportLine({
+        invoiceId: p.invoiceId,
+        paymentId: p.id,
+        bankRef: tx.providerRef,
+        status: 'MATCH',
+        note: tx.description
+      }));
+    } else {
+      lines.push(new ReportLine({
+        bankRef: tx.providerRef,
+        status: 'UNMATCH',
+        note: 'Không tìm thấy payment tương ứng'
+      }));
+    }
+  }
+
+  const report = new Report({
+    period,
+    channel,
+    totals: {
+      totalAmount,
+      matchedAmount,
+      unmatchedAmount: totalAmount - matchedAmount
+    }
+  });
+
+  return reportRepo.save(report, lines);
+}
+
+module.exports = { reconcile };
+
+```
